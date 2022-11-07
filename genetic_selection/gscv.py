@@ -34,6 +34,8 @@ from deap import creator
 from deap import tools
 
 
+#@ specify 3 objectives: (1) mean CV ACC (maximize), (2) num. of features (minimize), (3) std of CV ACC's (minimize)
+#@ the magnitude of the weight is used to vary the importance of each objective one against another (here all 1's mean that all 3 objs are equally important)
 creator.create("Fitness", base.Fitness, weights=(1.0, -1.0, -1.0))
 creator.create("Individual", list, fitness=creator.Fitness)
 
@@ -107,15 +109,28 @@ def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, sta
     return population, logbook
 
 
-def _createIndividual(icls, n, max_features):
+def _createIndividual(icls, n, max_features):  #@ icls: class for individual (here is a list)
     n_features = np.random.randint(1, max_features + 1)
     genome = ([1] * n_features) + ([0] * (n - n_features))
     np.random.shuffle(genome)
     return icls(genome)
 
 
-def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, max_features,
+#@ Fitness function. Mod this to also include selecting hyperparams in GA
+def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, max_features, hparams,
                   caching, scores_cache={}):
+    if hparams:
+        #@ extract info of hparams from individual's bit string
+        n_pbits = hparams['bitwidth']
+        i = 0
+        for j, hparam in enumerate(hparams['names']):
+            bin_str = individual[i:i+n_pbits]  # genotype
+            dec_val = int(''.join(str(b) for b in bin_str), 2)  # decimal value of bin string
+            p_min, p_max = hparams['range'][j][0], hparams['range'][j][1]
+            p = p_min + dec_val*((p_max-p_min)/(2**n_pbits-1))  # actual value of param (phenotype)
+            setattr(estimator, hparam, p)
+            i += n_pbits
+        individual = individual[i:]
     individual_sum = np.sum(individual, axis=0)
     if individual_sum == 0 or individual_sum > max_features:
         return -10000, individual_sum, 10000
@@ -129,7 +144,7 @@ def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, m
     scores_std = np.std(scores)
     if caching:
         scores_cache[individual_tuple] = [scores_mean, scores_std]
-    return scores_mean, individual_sum, scores_std
+    return scores_mean, individual_sum, scores_std  #@ multi-objective fitness function
 
 
 class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
@@ -235,7 +250,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
     def __init__(self, estimator, cv=None, scoring=None, fit_params=None, max_features=None,
                  verbose=0, n_jobs=1, n_population=300, crossover_proba=0.5, mutation_proba=0.2,
                  n_generations=40, crossover_independent_proba=0.1,
-                 mutation_independent_proba=0.05, tournament_size=3, n_gen_no_change=None,
+                 mutation_independent_proba=0.05, tournament_size=3, n_gen_no_change=None, hparams=None,
                  caching=False):
         self.estimator = estimator
         self.cv = cv
@@ -252,6 +267,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         self.mutation_independent_proba = mutation_independent_proba
         self.tournament_size = tournament_size
         self.n_gen_no_change = n_gen_no_change
+        self.hparams = hparams
         self.caching = caching
         self.scores_cache = {}
 
@@ -312,7 +328,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
         toolbox.register("evaluate", _evalFunction, estimator=estimator, X=X, y=y,
                          groups=groups, cv=cv, scorer=scorer, fit_params=self.fit_params,
-                         max_features=max_features, caching=self.caching,
+                         max_features=max_features, hparams=self.hparams, caching=self.caching,
                          scores_cache=self.scores_cache)
         toolbox.register("mate", tools.cxUniform, indpb=self.crossover_independent_proba)
         toolbox.register("mutate", tools.mutFlipBit, indpb=self.mutation_independent_proba)
