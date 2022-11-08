@@ -17,6 +17,7 @@
 
 import numbers
 import multiprocess
+import itertools
 import numpy as np
 from sklearn.utils import check_X_y
 from sklearn.utils.metaestimators import if_delegate_has_method
@@ -36,12 +37,12 @@ from deap import tools
 
 #@ specify 3 objectives: (1) mean CV ACC (maximize), (2) num. of features (minimize), (3) std of CV ACC's (minimize)
 #@ the magnitude of the weight is used to vary the importance of each objective one against another (here all 1's mean that all 3 objs are equally important)
-creator.create("Fitness", base.Fitness, weights=(1.0, -1.0, -1.0))
+creator.create("Fitness", base.Fitness, weights=(1.0, -0.1, -0.5))
 creator.create("Individual", list, fitness=creator.Fitness)
 
 
 def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, stats=None,
-                halloffame=None, verbose=0):
+                halloffame=None, verbose=0, hparams=None, hparam_bits=0):
     logbook = tools.Logbook()
     logbook.header = ['gen', 'nevals'] + (stats.fields if stats else [])
 
@@ -69,9 +70,22 @@ def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, sta
         offspring = toolbox.select(population, len(population) - hof_size)
 
         # Vary the pool of individuals
-        offspring = algorithms.varAnd(offspring, toolbox, cxpb, mutpb)
+        if hparams:  # split the gene of each ind in offspring into [param 1's gene] + [param 2's gene] + ... + [gene for features] and variate each separately
+            n_pbits = hparams['bitwidth']
+            genes = []
+            i = 0
+            for _ in range(len(hparams['names'])):
+                offspring_h = [creator.Individual(ind[i:i+n_pbits]) for ind in offspring]
+                genes.append(algorithms.varAnd(offspring_h, toolbox, cxpb, mutpb))
+                i += n_pbits
+            offspring_f = [creator.Individual(ind[i:]) for ind in offspring]
+            genes.append(algorithms.varAnd(offspring_f, toolbox, cxpb, mutpb))
+            offspring = [creator.Individual(itertools.chain.from_iterable(ind)) for ind in zip(*genes)]
+            # print(len(offspring), type(offspring[0]), offspring[0])
+        else:
+            offspring = algorithms.varAnd(offspring, toolbox, cxpb, mutpb)
 
-        # Evaluate the individuals with an invalid fitness
+        # Evaluate the individuals with an invalid fitness (i.e., the modified individuals)
         invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
         fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
         for ind, fit in zip(invalid_ind, fitnesses):
@@ -109,17 +123,23 @@ def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, sta
     return population, logbook
 
 
-def _createIndividual(icls, n, max_features):  #@ icls: class for individual (here is a list)
+def _createIndividual(icls, n, max_features, hparams, hparam_bits):  #@ icls: class for individual (here is a list)
     n_features = np.random.randint(1, max_features + 1)
-    genome = ([1] * n_features) + ([0] * (n - n_features))
-    np.random.shuffle(genome)
-    return icls(genome)
+    f_genome = ([1] * n_features) + ([0] * (n - n_features))
+    np.random.shuffle(f_genome)
+    if hparams:
+        n_1 = np.random.randint(0, hparam_bits + 1)
+        h_genome = ([1] * n_1) + ([0] * (hparam_bits - n_1))
+        # h_genome = [0] * hparam_bits
+        np.random.shuffle(h_genome)
+        return icls(h_genome + f_genome)
+    else:   return icls(f_genome)
 
 
 #@ Fitness function. Mod this to also include selecting hyperparams in GA
 def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, max_features, hparams,
                   caching, scores_cache={}):
-    if hparams:
+    if hparams:  #@ WHY this block causes a decrease in performance, even when hparams is None???
         #@ extract info of hparams from individual's bit string
         n_pbits = hparams['bitwidth']
         i = 0
@@ -268,6 +288,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         self.tournament_size = tournament_size
         self.n_gen_no_change = n_gen_no_change
         self.hparams = hparams
+        self.hparam_bits = len(self.hparams['names'])*self.hparams['bitwidth'] if self.hparams else 0  #@ number of bits for all hyperparameters to be tuned
         self.caching = caching
         self.scores_cache = {}
 
@@ -324,7 +345,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         toolbox = base.Toolbox()
 
         toolbox.register("individual", _createIndividual, creator.Individual, n=n_features,
-                         max_features=max_features)
+                         max_features=max_features, hparams=self.hparams, hparam_bits=self.hparam_bits)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
         toolbox.register("evaluate", _evalFunction, estimator=estimator, X=X, y=y,
                          groups=groups, cv=cv, scorer=scorer, fit_params=self.fit_params,
@@ -358,13 +379,29 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
             _, log = _eaFunction(pop, toolbox, cxpb=self.crossover_proba,
                                  mutpb=self.mutation_proba, ngen=self.n_generations,
                                  ngen_no_change=self.n_gen_no_change,
-                                 stats=stats, halloffame=hof, verbose=self.verbose)
+                                 stats=stats, halloffame=hof, verbose=self.verbose, hparams=self.hparams, hparam_bits=self.hparam_bits)
         if self.n_jobs != 1:
             pool.close()
             pool.join()
 
         # Set final attributes
-        support_ = np.array(hof, dtype=np.bool)[0]
+        if self.hparams:
+            support_ = np.array(hof, dtype=np.bool)[0][self.hparam_bits:]
+            n_pbits = self.hparams['bitwidth']
+            i = 0
+            best_params_binstr = hof[0][:self.hparam_bits]
+            best_params_ = {}
+            for j, hparam in enumerate(self.hparams['names']):
+                bin_str = best_params_binstr[i:i+n_pbits]  # genotype
+                dec_val = int(''.join(str(b) for b in bin_str), 2)  # decimal value of bin string
+                p_min, p_max = self.hparams['range'][j][0], self.hparams['range'][j][1]
+                p = p_min + dec_val*((p_max-p_min)/(2**n_pbits-1))  # actual value of param (phenotype)
+                best_params_[hparam] = p
+                i += n_pbits
+            self.best_params_ = best_params_
+        else:
+            support_ = np.array(hof, dtype=np.bool)[0]
+            self.best_params_ = self.estimator.get_params()
         self.estimator_ = clone(self.estimator)
         self.estimator_.fit(X[:, support_], y)
 
