@@ -29,6 +29,8 @@ from sklearn.model_selection import check_cv, cross_val_score
 from sklearn.metrics import check_scoring
 from sklearn.feature_selection import SelectorMixin
 from sklearn.utils._joblib import cpu_count
+from sklearn.utils._testing import ignore_warnings
+from sklearn.exceptions import ConvergenceWarning
 from deap import algorithms
 from deap import base
 from deap import creator
@@ -37,8 +39,8 @@ from deap import tools
 
 #@ specify 3 objectives: (1) mean CV ACC (maximize), (2) num. of features (minimize), (3) std of CV ACC's (minimize)
 #@ the magnitude of the weight is used to vary the importance of each objective one against another (here all 1's mean that all 3 objs are equally important)
-creator.create("Fitness", base.Fitness, weights=(1.0, -0.1, -0.5))
-creator.create("Individual", list, fitness=creator.Fitness)
+creator.create("Fitness_new", base.Fitness, weights=(1.0, -0.1, -0.5))
+creator.create("Individual_new", list, fitness=creator.Fitness_new)
 
 
 def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, stats=None,
@@ -48,7 +50,7 @@ def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, sta
 
     # Evaluate the individuals with an invalid fitness
     invalid_ind = [ind for ind in population if not ind.fitness.valid]
-    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)  #@ apply _evalFunction() on each of the ind in invalid_ind
     for ind, fit in zip(invalid_ind, fitnesses):
         ind.fitness.values = fit
 
@@ -75,13 +77,12 @@ def _eaFunction(population, toolbox, cxpb, mutpb, ngen, ngen_no_change=None, sta
             genes = []
             i = 0
             for _ in range(len(hparams['names'])):
-                offspring_h = [creator.Individual(ind[i:i+n_pbits]) for ind in offspring]
+                offspring_h = [creator.Individual_new(ind[i:i+n_pbits]) for ind in offspring]
                 genes.append(algorithms.varAnd(offspring_h, toolbox, cxpb, mutpb))
                 i += n_pbits
-            offspring_f = [creator.Individual(ind[i:]) for ind in offspring]
+            offspring_f = [creator.Individual_new(ind[i:]) for ind in offspring]
             genes.append(algorithms.varAnd(offspring_f, toolbox, cxpb, mutpb))
-            offspring = [creator.Individual(itertools.chain.from_iterable(ind)) for ind in zip(*genes)]
-            # print(len(offspring), type(offspring[0]), offspring[0])
+            offspring = [creator.Individual_new(itertools.chain.from_iterable(ind)) for ind in zip(*genes)]
         else:
             offspring = algorithms.varAnd(offspring, toolbox, cxpb, mutpb)
 
@@ -137,6 +138,7 @@ def _createIndividual(icls, n, max_features, hparams, hparam_bits):  #@ icls: cl
 
 
 #@ Fitness function. Mod this to also include selecting hyperparams in GA
+@ignore_warnings(category=ConvergenceWarning)
 def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, max_features, hparams,
                   caching, scores_cache={}):
     if hparams:  #@ WHY this block causes a decrease in performance, even when hparams is None???
@@ -148,6 +150,7 @@ def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, m
             dec_val = int(''.join(str(b) for b in bin_str), 2)  # decimal value of bin string
             p_min, p_max = hparams['range'][j][0], hparams['range'][j][1]
             p = p_min + dec_val*((p_max-p_min)/(2**n_pbits-1))  # actual value of param (phenotype)
+            if hparam in ['max_depth']:      p = int(round(p, 0))
             setattr(estimator, hparam, p)
             i += n_pbits
         individual = individual[i:]
@@ -167,7 +170,7 @@ def _evalFunction(individual, estimator, X, y, groups, cv, scorer, fit_params, m
     return scores_mean, individual_sum, scores_std  #@ multi-objective fitness function
 
 
-class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
+class GeneticSelectionCV_mod(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
     """Feature selection with genetic algorithm.
 
     Parameters
@@ -344,7 +347,7 @@ class GeneticSelectionCV(BaseEstimator, MetaEstimatorMixin, SelectorMixin):
         # Genetic Algorithm
         toolbox = base.Toolbox()
 
-        toolbox.register("individual", _createIndividual, creator.Individual, n=n_features,
+        toolbox.register("individual", _createIndividual, creator.Individual_new, n=n_features,
                          max_features=max_features, hparams=self.hparams, hparam_bits=self.hparam_bits)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
         toolbox.register("evaluate", _evalFunction, estimator=estimator, X=X, y=y,
